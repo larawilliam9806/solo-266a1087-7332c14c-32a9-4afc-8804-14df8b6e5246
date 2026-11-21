@@ -10,6 +10,9 @@ services:
       CATALOG_FILE: /data/catalog.json
       # Comma-separated UTC dates whose queries should fail, to demo retries.
       MOCK_FAIL_DATES: ${MOCK_FAIL_DATES:-}
+      # Set to a positive integer to interrupt the legacy organizer after N
+      # moved rows in a batch, demonstrating retry without losing progress.
+      MIGRATE_FAIL_AFTER: ${MIGRATE_FAIL_AFTER:-}
       SECRET_KEY: ${SECRET_KEY:-dev-only-change-me}
     volumes:
       - archive-data:/data

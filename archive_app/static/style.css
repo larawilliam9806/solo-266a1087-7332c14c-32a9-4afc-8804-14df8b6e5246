@@ -26,6 +26,9 @@ body {
   color: #fff;
 }
 .brand { color: #fff; text-decoration: none; font-weight: 600; }
+.topnav { display: flex; gap: 14px; margin-left: 18px; }
+.topnav a { color: #c7d0dc; text-decoration: none; font-size: 14px; }
+.topnav a:hover { color: #fff; }
 .hint { color: #c7d0dc; font-size: 13px; }
 main { max-width: 1080px; margin: 24px auto 60px; padding: 0 20px; }
 .card {
@@ -83,6 +86,8 @@ th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: upp
 .stat-complete .num { color: var(--ok); }
 .stat-blocked .num { color: var(--blocked); }
 .stat-failed .num { color: var(--bad); }
+.stat-pending .num { color: var(--accent); }
+.stat-shared .num { color: var(--blocked); }
 .banner {
   background: #eef4ff;
   border: 1px solid #c8dbff;
@@ -92,6 +97,25 @@ th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: upp
   font-size: 13px;
 }
 .banner.ok { background: #eaf7ee; border-color: #b7e1c1; color: var(--ok); }
+.banner.bad { background: #fdecea; border-color: #f5c2bd; color: var(--bad); }
+.progress {
+  height: 10px;
+  border-radius: 999px;
+  background: #eef1f4;
+  overflow: hidden;
+  margin: 14px 0 6px;
+}
+.progress-bar {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 999px;
+  transition: width .2s ease;
+}
+.rules { padding-left: 18px; line-height: 1.9; }
+button:disabled, .disabled-btn {
+  background: #c3cad3;
+  cursor: not-allowed;
+}
 .badge {
   display: inline-block;
   padding: 2px 9px;

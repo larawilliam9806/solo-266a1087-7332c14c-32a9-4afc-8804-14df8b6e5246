@@ -15,6 +15,32 @@
 </section>
 
 <section class="card">
+  <h2>旧库整理</h2>
+  <p class="muted">
+    把旧库中的历史归档迁入共享明细存储。编号、UTC 发震时刻和震级完全相同的事件共用一份明细，
+    同号异值在不同任务中各存一份；每个任务的归档日、来源与进度保持不变。
+  </p>
+  <div class="stats">
+    <div class="stat stat-pending">
+      <span class="num">{{ legacy['legacy_pending'] }}</span>
+      <span class="lbl">待整理记录数</span>
+    </div>
+    <div class="stat stat-shared">
+      <span class="num">{{ legacy['shared_details'] }}</span>
+      <span class="lbl">共享明细数</span>
+    </div>
+    <div class="stat">
+      <span class="num">{{ legacy['status'] | migration_label }}</span>
+      <span class="lbl">整理状态</span>
+    </div>
+  </div>
+  <p>
+    <a class="button" href="{{ url_for('legacy_overview') }}">进入旧库整理</a>
+    {% if legacy['status'] == 'done' %}<span class="muted">旧库已清空，新采集直接写入共享存储。</span>{% endif %}
+  </p>
+</section>
+
+<section class="card">
   <h2>归档任务</h2>
   {% if runs %}
   <table>

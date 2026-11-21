@@ -19,6 +19,10 @@ from werkzeug.exceptions import RequestEntityTooLarge
 
 from .catalog import (
     MAX_SPAN_DAYS,
+    MIGRATION_DONE,
+    MIGRATION_FAILED,
+    MIGRATION_PENDING,
+    MIGRATION_RUNNING,
     STATUS_BLOCKED,
     STATUS_COMPLETE,
     STATUS_FAILED,
@@ -37,11 +41,32 @@ STATUS_LABELS = {
     STATUS_FAILED: "待重试",
 }
 
+MIGRATION_LABELS = {
+    MIGRATION_PENDING: "待整理",
+    MIGRATION_RUNNING: "整理中",
+    MIGRATION_FAILED: "上次失败，可重试",
+    MIGRATION_DONE: "整理完成",
+}
+
+MIGRATION_BATCH_SIZE = 500
+
+
+def _int_env(name: str) -> int | None:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
 
 def create_app(
     database: str | None = None,
     source=None,
     testing: bool = False,
+    migrate_fail_after: int | None = None,
 ) -> Flask:
     app = Flask(__name__)
     app.config.update(
@@ -49,6 +74,9 @@ def create_app(
         DATABASE=database or os.environ.get("DATABASE", "/data/archive.db"),
         MAX_CONTENT_LENGTH=4 * 1024 * 1024,
         TESTING=testing,
+        MIGRATE_FAIL_AFTER=migrate_fail_after
+        if migrate_fail_after is not None
+        else _int_env("MIGRATE_FAIL_AFTER"),
     )
     store = Store(app.config["DATABASE"])
     store.init()
@@ -66,6 +94,10 @@ def create_app(
     def status_label(value: str) -> str:
         return STATUS_LABELS.get(value, value)
 
+    @app.template_filter("migration_label")
+    def migration_label(value: str) -> str:
+        return MIGRATION_LABELS.get(value, value)
+
     @app.get("/")
     def index():
         st: Store = current_store()
@@ -74,7 +106,52 @@ def create_app(
             runs=st.runs(),
             max_span=MAX_SPAN_DAYS,
             page_size=current_source().page_size(),
+            legacy=st.legacy_status(),
         )
+
+    @app.get("/legacy")
+    def legacy_overview():
+        st: Store = current_store()
+        return render_template(
+            "legacy.html",
+            legacy=st.legacy_status(),
+            labels=MIGRATION_LABELS,
+        )
+
+    @app.post("/legacy/organize")
+    def legacy_organize():
+        st: Store = current_store()
+        if not work_lock.acquire(blocking=False):
+            flash("已有采集、补档或整理操作在进行，请稍后重试", "warn")
+            return redirect(url_for("legacy_overview"))
+        try:
+            before = st.legacy_status()
+            status = st.run_migration_batch(
+                budget=MIGRATION_BATCH_SIZE,
+                fail_after=app.config["MIGRATE_FAIL_AFTER"],
+            )
+        except Exception as exc:
+            # 中断/写入失败：已提交的批次和进度仍在，可直接重试。
+            flash(f"整理中断（已保存的进度不受影响，可再次点击整理）：{exc}", "warn")
+            return redirect(url_for("legacy_overview"))
+        finally:
+            work_lock.release()
+
+        if status["status"] == MIGRATION_DONE and before["status"] != MIGRATION_DONE:
+            flash(
+                "旧库整理完成：旧记录与整理期间入库的记录均已纳入共享存储，"
+                f"共 {status['moved_rows']} 条引用、{status['shared_details']} 份共享明细。",
+                "info",
+            )
+        elif status["status"] == MIGRATION_DONE:
+            flash("旧库已全部纳入共享存储，暂无待整理记录。", "info")
+        else:
+            flash(
+                f"本批已整理 {status['moved_rows'] - before['moved_rows']} 条，"
+                f"还剩 {status['legacy_pending']} 条待整理，可继续点击整理。",
+                "info",
+            )
+        return redirect(url_for("legacy_overview"))
 
     @app.post("/runs")
     def create_run():

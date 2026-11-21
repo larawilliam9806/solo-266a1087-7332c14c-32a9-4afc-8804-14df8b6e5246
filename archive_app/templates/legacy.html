@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% block title %}旧库整理 · 历史地震目录归档{% endblock %}
+{% block content %}
+<section class="card">
+  <div class="spread">
+    <div>
+      <h1>旧库整理</h1>
+      <p class="muted">
+        旧库记录分批迁入共享明细存储。整理期间采集与补档仍可正常保存；
+        中断或写入失败后可重试，已归档的数据与进度不受影响。
+      </p>
+    </div>
+    <div class="actions">
+      <form method="post" action="{{ url_for('legacy_organize') }}">
+        <button type="submit" {% if legacy['status'] == 'done' and legacy['legacy_pending'] == 0 %}disabled class="disabled-btn"{% endif %}>
+          {% if legacy['status'] == 'failed' %}重试整理{% else %}整理一批（500 条）{% endif %}
+        </button>
+      </form>
+    </div>
+  </div>
+
+  <div class="stats">
+    <div class="stat stat-pending">
+      <span class="num">{{ legacy['legacy_pending'] }}</span>
+      <span class="lbl">待整理记录数</span>
+    </div>
+    <div class="stat stat-shared">
+      <span class="num">{{ legacy['shared_details'] }}</span>
+      <span class="lbl">共享明细数</span>
+    </div>
+    <div class="stat">
+      <span class="num">{{ legacy['shared_refs'] }}</span>
+      <span class="lbl">任务引用数</span>
+    </div>
+    <div class="stat">
+      <span class="num">{{ legacy['status'] | migration_label }}</span>
+      <span class="lbl">整理状态</span>
+    </div>
+  </div>
+
+  {% if legacy['total_rows'] > 0 %}
+  <div class="progress" role="progressbar"
+       aria-valuemin="0" aria-valuemax="{{ legacy['total_rows'] }}"
+       aria-valuenow="{{ legacy['moved_rows'] }}">
+    <div class="progress-bar" style="width: {{ (100 * legacy['moved_rows'] / legacy['total_rows']) | round(1) }}%"></div>
+  </div>
+  <p class="muted">
+    已迁入 {{ legacy['moved_rows'] }} / {{ legacy['total_rows'] }} 条
+    （{% if legacy['total_rows'] %}{{ (100 * legacy['moved_rows'] / legacy['total_rows']) | round(1) }}{% else %}0.0{% endif %}%）
+    {% if legacy['updated_at'] %}· 最近更新 {{ legacy['updated_at'] }}{% endif %}
+  </p>
+  {% endif %}
+
+  {% if legacy['status'] == 'failed' %}
+  <p class="banner bad">上一批整理失败：{{ legacy['last_error'] or '写入失败' }}。已提交的批次仍然有效，点击“重试整理”即可继续。</p>
+  {% elif legacy['status'] == 'done' %}
+  <p class="banner ok">旧库已清空，旧记录与整理期间入库的记录均已纳入共享存储；新采集与补档直接写入共享明细。</p>
+  {% else %}
+  <p class="banner">整理尚未结束时，采集和补档仍可保存；任务页与 CSV 下载始终读取本任务在新旧两套存储中的全部数据。</p>
+  {% endif %}
+
+  <h2>共用与回收规则</h2>
+  <ul class="muted rules">
+    <li>编号、UTC 发震时刻和震级完全相同的事件，多个任务共用同一份共享明细。</li>
+    <li>同号异值视为不同事件，在不同任务中各存一份明细与引用。</li>
+    <li>补档只替换本任务当天的引用；其他任务仍在引用的明细不会被回收。</li>
+    <li>当最后一个任务引用移除时，对应共享明细才会被自动回收。</li>
+  </ul>
+  <p><a href="{{ url_for('index') }}">← 返回任务列表</a></p>
+</section>
+{% endblock %}

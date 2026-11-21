@@ -170,6 +170,7 @@ CREATE TABLE IF NOT EXISTS day_status (
     PRIMARY KEY (run_id, day),
     FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
 );
+-- 旧库表：共享存储上线前的归档数据，旧库整理期间仍可写入，整理后清空
 CREATE TABLE IF NOT EXISTS events (
     run_id INTEGER NOT NULL,
     day TEXT NOT NULL,
@@ -181,12 +182,69 @@ CREATE TABLE IF NOT EXISTS events (
     FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_events_day ON events(run_id, day);
+
+-- 共享明细：编号、UTC 发震时刻、震级完全相同的事件共用一份；
+-- 同号异值（三元组不同）是不同明细，在不同任务中各存一份。
+CREATE TABLE IF NOT EXISTS event_details (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL,
+    utc_time TEXT NOT NULL,
+    magnitude REAL NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (event_id, utc_time, magnitude)
+);
+-- 任务对明细的引用：归档日、来源、进度仍按任务分别保存
+CREATE TABLE IF NOT EXISTS event_refs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL,
+    day TEXT NOT NULL,
+    detail_id INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (run_id, detail_id),
+    FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE,
+    FOREIGN KEY (detail_id) REFERENCES event_details(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_refs_run ON event_refs(run_id);
+CREATE INDEX IF NOT EXISTS idx_refs_run_day ON event_refs(run_id, day);
+-- 最后一个任务引用被移除（含任务删除、补档替换）时回收对应明细
+CREATE TRIGGER IF NOT EXISTS trg_refs_after_delete AFTER DELETE ON event_refs
+BEGIN
+    DELETE FROM event_details
+     WHERE id = OLD.detail_id
+       AND NOT EXISTS (SELECT 1 FROM event_refs WHERE detail_id = OLD.detail_id);
+END;
+-- 统一读取视图：整理期间新旧两套存储并行，任务页与下载都读全本任务数据
+CREATE VIEW IF NOT EXISTS run_events AS
+SELECT run_id, day, event_id, utc_time, magnitude, source
+  FROM events
+UNION ALL
+SELECT r.run_id, r.day, d.event_id, d.utc_time, d.magnitude, r.source
+  FROM event_refs r
+  JOIN event_details d ON d.id = r.detail_id;
+-- 旧库整理进度（单行，id 固定为 1）
+CREATE TABLE IF NOT EXISTS migration_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    status TEXT NOT NULL,
+    total_rows INTEGER NOT NULL DEFAULT 0,
+    moved_rows INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    updated_at TEXT
+);
 """
 
 STATUS_PENDING = "pending"
 STATUS_COMPLETE = "complete"   # day is fully archived
 STATUS_BLOCKED = "blocked"     # day returned a full page; needs CSV backfill
 STATUS_FAILED = "failed"       # request failed; retry later
+
+# 旧库整理状态
+MIGRATION_PENDING = "pending"    # 尚未开始或有待整理记录
+MIGRATION_RUNNING = "running"    # 整理进行中（可中断、可重试）
+MIGRATION_DONE = "done"          # 旧库已清空，全部进入共享存储
+MIGRATION_FAILED = "failed"      # 上一批写入失败，进度保留、可重试
+
+MIGRATION_CHUNK = 100  # 每提交一个事务的行数，保证中断后已提交进度不丢
 
 ALLOWED_TRANSITIONS = {
     STATUS_PENDING: {STATUS_COMPLETE, STATUS_BLOCKED, STATUS_FAILED},
@@ -211,6 +269,171 @@ class Store:
     def init(self) -> None:
         with self._lock, self.connect() as conn:
             conn.executescript(SCHEMA)
+            self._ensure_migration_row(conn)
+            conn.commit()
+
+    # -- legacy migration state ---------------------------------------
+
+    @staticmethod
+    def _now() -> str:
+        return dt.datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def _legacy_count(self, conn: sqlite3.Connection) -> int:
+        return int(
+            conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        )
+
+    def _ensure_migration_row(self, conn: sqlite3.Connection) -> None:
+        """Create the single migration row, deriving status from stored data.
+
+        Fresh deployments (no legacy rows at all) start directly in the shared
+        storage.  Databases carrying rows from the old schema start pending;
+        if a previously-finished migration finds new legacy rows (for example
+        rows written by another process during the cut-over), it reopens so the
+        next organize call absorbs them.
+        """
+        row = conn.execute("SELECT status FROM migration_state WHERE id=1").fetchone()
+        legacy = self._legacy_count(conn)
+        if row is None:
+            status = MIGRATION_PENDING if legacy else MIGRATION_DONE
+            conn.execute(
+                "INSERT INTO migration_state(id, status, total_rows, moved_rows, updated_at) "
+                "VALUES (1,?,?,?,?)",
+                (status, legacy, 0, self._now()),
+            )
+            return
+        if row["status"] == MIGRATION_DONE and legacy:
+            total = int(
+                conn.execute("SELECT COUNT(*) FROM event_refs").fetchone()[0]
+            ) + legacy
+            conn.execute(
+                "UPDATE migration_state SET status=?, total_rows=?, last_error=NULL, updated_at=? "
+                "WHERE id=1",
+                (MIGRATION_PENDING, total, self._now()),
+            )
+
+    def legacy_status(self) -> dict[str, int | str | None]:
+        """Counts for the 旧库整理 entry: pending legacy rows and shared details."""
+        with self.connect() as conn:
+            self._ensure_migration_row(conn)
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM migration_state WHERE id=1"
+            ).fetchone()
+            legacy = self._legacy_count(conn)
+            shared = int(
+                conn.execute("SELECT COUNT(*) FROM event_details").fetchone()[0]
+            )
+            refs = int(
+                conn.execute("SELECT COUNT(*) FROM event_refs").fetchone()[0]
+            )
+        return {
+            "status": row["status"],
+            "legacy_pending": legacy,
+            "shared_details": shared,
+            "shared_refs": refs,
+            "total_rows": max(int(row["total_rows"]), legacy + refs),
+            "moved_rows": refs,
+            "last_error": row["last_error"],
+            "updated_at": row["updated_at"],
+        }
+
+    def _use_shared(self, conn: sqlite3.Connection) -> bool:
+        """Writes go shared once the legacy migration is fully done."""
+        row = conn.execute("SELECT status FROM migration_state WHERE id=1").fetchone()
+        return row is not None and row["status"] == MIGRATION_DONE
+
+    def run_migration_batch(
+        self, budget: int = 500, fail_after: int | None = None
+    ) -> dict[str, int | str | None]:
+        """Move one batch of legacy rows into the shared store.
+
+        Each chunk commits in its own transaction, so a crash or write failure
+        keeps everything committed so far: already-archived data and progress
+        stay usable and the call can simply be retried.
+        """
+        with self._lock:
+            with self.connect() as conn:
+                self._ensure_migration_row(conn)
+                conn.commit()
+                state = conn.execute(
+                    "SELECT * FROM migration_state WHERE id=1"
+                ).fetchone()
+                legacy = self._legacy_count(conn)
+                if state["status"] == MIGRATION_DONE and not legacy:
+                    return self.legacy_status()
+                refs = int(
+                    conn.execute("SELECT COUNT(*) FROM event_refs").fetchone()[0]
+                )
+                total = max(int(state["total_rows"]), legacy + refs)
+                conn.execute(
+                    "UPDATE migration_state SET status=?, total_rows=?, last_error=NULL, updated_at=? "
+                    "WHERE id=1",
+                    (MIGRATION_RUNNING, total, self._now()),
+                )
+                conn.commit()
+
+            processed = 0
+            try:
+                while processed < budget:
+                    with self.connect() as conn:
+                        rows = conn.execute(
+                            "SELECT rowid, run_id, day, event_id, utc_time, magnitude, source "
+                            "FROM events ORDER BY rowid LIMIT ?",
+                            (min(MIGRATION_CHUNK, budget - processed),),
+                        ).fetchall()
+                        if not rows:
+                            break
+                        try:
+                            conn.execute("BEGIN")
+                            for row in rows:
+                                self._migrate_row(conn, row)
+                                processed += 1
+                                if fail_after is not None and processed >= fail_after:
+                                    raise OSError("模拟写入失败（MIGRATE_FAIL_AFTER）")
+                            conn.commit()
+                        except Exception:
+                            conn.rollback()
+                            raise
+            except Exception as exc:
+                with self.connect() as conn:
+                    refs = int(
+                        conn.execute("SELECT COUNT(*) FROM event_refs").fetchone()[0]
+                    )
+                    legacy = self._legacy_count(conn)
+                    conn.execute(
+                        "UPDATE migration_state SET status=?, total_rows=?, moved_rows=?, "
+                        "last_error=?, updated_at=? WHERE id=1",
+                        (MIGRATION_FAILED, max(total, legacy + refs), refs, str(exc), self._now()),
+                    )
+                    conn.commit()
+                raise
+
+            with self.connect() as conn:
+                refs = int(
+                    conn.execute("SELECT COUNT(*) FROM event_refs").fetchone()[0]
+                )
+                legacy = self._legacy_count(conn)
+                new_total = max(total, legacy + refs)
+                status = MIGRATION_DONE if not legacy else MIGRATION_RUNNING
+                conn.execute(
+                    "UPDATE migration_state SET status=?, total_rows=?, moved_rows=?, "
+                    "last_error=NULL, updated_at=? WHERE id=1",
+                    (status, new_total, refs, self._now()),
+                )
+                conn.commit()
+        return self.legacy_status()
+
+    def _migrate_row(self, conn: sqlite3.Connection, row: sqlite3.Row) -> None:
+        detail_id = self._insert_detail(
+            conn, row["event_id"], row["utc_time"], row["magnitude"]
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO event_refs(run_id, day, detail_id, source, created_at) "
+            "VALUES (?,?,?,?,?)",
+            (row["run_id"], row["day"], detail_id, row["source"], self._now()),
+        )
+        conn.execute("DELETE FROM events WHERE rowid=?", (row["rowid"],))
 
     # -- runs ---------------------------------------------------------
 
@@ -222,7 +445,7 @@ class Store:
 
     @staticmethod
     def _create_run(conn: sqlite3.Connection, start: dt.date, end: dt.date) -> int:
-        now = dt.datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        now = Store._now()
         cur = conn.execute(
             "INSERT INTO runs(start_date, end_date, created_at) VALUES (?,?,?)",
             (start.isoformat(), end.isoformat(), now),
@@ -257,14 +480,17 @@ class Store:
             ).fetchall()
 
     def events(self, run_id: int, day: str | None = None) -> list[sqlite3.Row]:
+        """All events visible to a task, from whichever store currently holds them."""
         with self.connect() as conn:
             if day is None:
                 return conn.execute(
-                    "SELECT * FROM events WHERE run_id=? ORDER BY utc_time, event_id",
+                    "SELECT run_id, day, event_id, utc_time, magnitude, source "
+                    "FROM run_events WHERE run_id=? ORDER BY utc_time, event_id",
                     (run_id,),
                 ).fetchall()
             return conn.execute(
-                "SELECT * FROM events WHERE run_id=? AND day=? ORDER BY utc_time, event_id",
+                "SELECT run_id, day, event_id, utc_time, magnitude, source "
+                "FROM run_events WHERE run_id=? AND day=? ORDER BY utc_time, event_id",
                 (run_id, day),
             ).fetchall()
 
@@ -293,15 +519,95 @@ class Store:
         current = row["status"]
         if current not in ALLOWED_TRANSITIONS or status not in ALLOWED_TRANSITIONS[current]:
             raise ValueError(f"状态不允许从 {current} 变为 {status}")
-        now = dt.datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        now = Store._now()
         count = conn.execute(
-            "SELECT COUNT(*) FROM events WHERE run_id=? AND day=?", (run_id, day)
+            "SELECT COUNT(*) FROM run_events WHERE run_id=? AND day=?", (run_id, day)
         ).fetchone()[0]
         conn.execute(
             "UPDATE day_status SET status=?, event_count=?, checked_at=?, last_error=? "
             "WHERE run_id=? AND day=?",
             (status, count, now, last_error, run_id, day),
         )
+
+    # -- shared detail helpers ----------------------------------------
+
+    def _insert_detail(
+        self,
+        conn: sqlite3.Connection,
+        event_id: str,
+        utc_time: str,
+        magnitude: float,
+    ) -> int:
+        """Return the shared detail id for an event triple, creating it once."""
+        conn.execute(
+            "INSERT OR IGNORE INTO event_details(event_id, utc_time, magnitude, created_at) "
+            "VALUES (?,?,?,?)",
+            (event_id, utc_time, magnitude, self._now()),
+        )
+        row = conn.execute(
+            "SELECT id FROM event_details "
+            "WHERE event_id=? AND utc_time=? AND magnitude=?",
+            (event_id, utc_time, magnitude),
+        ).fetchone()
+        return int(row["id"])
+
+    def _insert_ref(
+        self,
+        conn: sqlite3.Connection,
+        run_id: int,
+        day: str,
+        event: Event,
+        source: str,
+    ) -> None:
+        if event.utc_time[:10] != day:
+            raise ValueError(f"事件 {event.event_id} 不在 {day}")
+        # 同一任务内编号仍唯一：同号异值不能同时出现在一个任务里，
+        # 但在不同任务中各存一份（作为不同的共享明细 + 各自的引用）。
+        clash = conn.execute(
+            "SELECT d.event_id FROM event_refs r JOIN event_details d ON d.id=r.detail_id "
+            "WHERE r.run_id=? AND d.event_id=?",
+            (run_id, event.event_id),
+        ).fetchone()
+        if clash is not None:
+            raise ValueError(f"事件编号冲突: {event.event_id}")
+        detail_id = self._insert_detail(conn, event.event_id, event.utc_time, event.magnitude)
+        conn.execute(
+            "INSERT INTO event_refs(run_id, day, detail_id, source, created_at) "
+            "VALUES (?,?,?,?,?)",
+            (run_id, day, detail_id, source, self._now()),
+        )
+
+    def _insert_legacy(
+        self,
+        conn: sqlite3.Connection,
+        run_id: int,
+        day: str,
+        event: Event,
+        source: str,
+    ) -> None:
+        if event.utc_time[:10] != day:
+            raise ValueError(f"事件 {event.event_id} 不在 {day}")
+        try:
+            conn.execute(
+                "INSERT INTO events(run_id, day, event_id, utc_time, magnitude, source) "
+                "VALUES (?,?,?,?,?,?)",
+                (run_id, day, event.event_id, event.utc_time, event.magnitude, source),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ValueError(f"事件编号冲突: {event.event_id}") from exc
+
+    def _store_event(
+        self,
+        conn: sqlite3.Connection,
+        run_id: int,
+        day: str,
+        event: Event,
+        source: str,
+    ) -> None:
+        if self._use_shared(conn):
+            self._insert_ref(conn, run_id, day, event, source)
+        else:
+            self._insert_legacy(conn, run_id, day, event, source)
 
     def complete_days(
         self,
@@ -313,21 +619,14 @@ class Store:
 
         The write is transactional: any conflict (for example the same event ID
         showing up on two days) rolls the range back so no day is half-recorded.
+        Works against the legacy table while the migration is open and against
+        the shared detail/ref store once it has finished.
         """
         with self._lock, self.connect() as conn:
             try:
                 for day, events in by_day.items():
                     for e in events:
-                        if e.utc_time[:10] != day:
-                            raise ValueError(f"事件 {e.event_id} 不在 {day}")
-                        try:
-                            conn.execute(
-                                "INSERT INTO events(run_id, day, event_id, utc_time, magnitude, source) "
-                                "VALUES (?,?,?,?,?,?)",
-                                (run_id, day, e.event_id, e.utc_time, e.magnitude, source),
-                            )
-                        except sqlite3.IntegrityError as exc:
-                            raise ValueError(f"事件编号冲突: {e.event_id}") from exc
+                        self._store_event(conn, run_id, day, e, source)
                     self._mark(conn, run_id, day, STATUS_COMPLETE)
             except Exception:
                 conn.rollback()
@@ -339,22 +638,34 @@ class Store:
         with self._lock, self.connect() as conn:
             try:
                 for e in events:
-                    try:
-                        conn.execute(
-                            "INSERT INTO events(run_id, day, event_id, utc_time, magnitude, source) "
-                            "VALUES (?,?,?,?,?,?)",
-                            (run_id, day, e.event_id, e.utc_time, e.magnitude, "api"),
-                        )
-                    except sqlite3.IntegrityError as exc:
-                        raise ValueError(f"事件编号冲突: {e.event_id}") from exc
+                    self._store_event(conn, run_id, day, e, "api")
                 self._mark(conn, run_id, day, STATUS_BLOCKED)
             except Exception:
                 conn.rollback()
                 raise
             conn.commit()
 
+    def _replace_shared(
+        self,
+        conn: sqlite3.Connection,
+        run_id: int,
+        day: str,
+        events: Sequence[Event],
+        source: str,
+    ) -> None:
+        """Backfill in the shared store: replace only this task's day.
+
+        Removing the refs drops the old details too once no other task
+        references them (the trigger handles reclamation).
+        """
+        conn.execute(
+            "DELETE FROM event_refs WHERE run_id=? AND day=?", (run_id, day)
+        )
+        for e in events:
+            self._insert_ref(conn, run_id, day, e, source)
+
     @staticmethod
-    def _replace(
+    def _replace_legacy(
         conn: sqlite3.Connection,
         run_id: int,
         day: str,
@@ -383,6 +694,8 @@ class Store:
 
         ``verify`` receives the already-collected events and may raise to abort;
         the whole operation rolls back in that case, preserving prior progress.
+        Only this task's rows for that day are replaced; shared details used by
+        other tasks are reclaimed only when their last reference disappears.
         """
         with self._lock, self.connect() as conn:
             row = conn.execute(
@@ -395,15 +708,22 @@ class Store:
             existing = [
                 Event(r["event_id"], r["utc_time"], r["magnitude"])
                 for r in conn.execute(
-                    "SELECT event_id, utc_time, magnitude FROM events "
+                    "SELECT event_id, utc_time, magnitude FROM run_events "
                     "WHERE run_id=? AND day=? ORDER BY utc_time, event_id",
                     (run_id, day),
                 )
             ]
-            if verify is not None:
-                verify(existing)
-            self._replace(conn, run_id, day, events, "csv")
-            self._mark(conn, run_id, day, STATUS_COMPLETE)
+            try:
+                if verify is not None:
+                    verify(existing)
+                if self._use_shared(conn):
+                    self._replace_shared(conn, run_id, day, events, "csv")
+                else:
+                    self._replace_legacy(conn, run_id, day, events, "csv")
+                self._mark(conn, run_id, day, STATUS_COMPLETE)
+            except Exception:
+                conn.rollback()
+                raise
             conn.commit()
 
     def is_ready(self, run_id: int) -> bool:
